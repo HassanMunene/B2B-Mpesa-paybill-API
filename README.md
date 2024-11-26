@@ -8,3 +8,4 @@ Basically the organization portal will help us create operators with the correct
 On the mpesa Business portal we will to create some users to manage transactions especially b2b intra transfer we will also come back to this.
 
 Something else I wanna throw here is that the organisation portal will be mainly for the apis but the business portal is mainly now managing your business account for the paybill. 
+First thing you should know is the   G2 portal (organization portal) is the one that is created first because after you apply for a paybill using the form I willprodive the form link, this first step is that the mpesa support team helps you create the G2 portal. So the only way you can have the Business portal is if you already have the G2 portal
