@@ -1,0 +1,1116 @@
+Complete Laravel M-Pesa Integration Setup Guide
+
+I'll walk you through creating a complete Laravel application with all the M-Pesa integration features we discussed. This includes STK Push, C2B payments, ngrok setup, real-time updates, and receipt printing.
+1. Project Setup
+Create a new Laravel project
+bash
+
+composer create-project laravel/laravel supermarket-mpesa
+cd supermarket-mpesa
+
+Install required packages
+bash
+
+composer require guzzlehttp/guzzle
+composer require laravel/ui
+
+Set up basic authentication (optional)
+bash
+
+php artisan ui bootstrap --auth
+npm install && npm run dev
+
+2. Database Configuration
+Update .env file
+ini
+
+DB_CONNECTION=mysql
+DB_HOST=127.0.0.1
+DB_PORT=3306
+DB_DATABASE=supermarket_mpesa
+DB_USERNAME=root
+DB_PASSWORD=
+
+Create required migrations
+
+    Create orders table:
+
+bash
+
+php artisan make:migration create_orders_table
+
+    Create mpesa_transactions table:
+
+bash
+
+php artisan make:migration create_mpesa_transactions_table
+
+    Edit the migrations:
+
+php
+
+// database/migrations/xxxx_create_orders_table.php
+Schema::create('orders', function (Blueprint $table) {
+    $table->id();
+    $table->string('customer_name');
+    $table->string('customer_phone');
+    $table->decimal('total', 10, 2);
+    $table->string('status')->default('pending');
+    $table->json('items'); // Stores order items as JSON
+    $table->timestamps();
+});
+
+// database/migrations/xxxx_create_mpesa_transactions_table.php
+Schema::create('mpesa_transactions', function (Blueprint $table) {
+    $table->id();
+    $table->string('merchant_request_id')->nullable();
+    $table->string('checkout_request_id')->nullable();
+    $table->decimal('amount', 10, 2);
+    $table->string('mpesa_receipt_number')->nullable();
+    $table->string('phone');
+    $table->string('transaction_date')->nullable();
+    $table->string('status')->default('pending');
+    $table->text('result_desc')->nullable();
+    $table->unsignedBigInteger('order_id')->nullable();
+    $table->string('account_reference');
+    $table->string('transaction_type'); // stk or c2b
+    $table->timestamps();
+    
+    $table->foreign('order_id')->references('id')->on('orders');
+});
+
+Run migrations
+bash
+
+php artisan migrate
+
+3. Model Setup
+Create models
+bash
+
+php artisan make:model Order
+php artisan make:model MpesaTransaction
+
+Edit the models
+php
+
+// app/Models/Order.php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class Order extends Model
+{
+    protected $fillable = [
+        'customer_name', 
+        'customer_phone',
+        'total',
+        'status',
+        'items'
+    ];
+    
+    protected $casts = [
+        'items' => 'array'
+    ];
+    
+    public function payments()
+    {
+        return $this->hasMany(MpesaTransaction::class);
+    }
+}
+
+// app/Models/MpesaTransaction.php
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class MpesaTransaction extends Model
+{
+    protected $fillable = [
+        'merchant_request_id',
+        'checkout_request_id',
+        'amount',
+        'mpesa_receipt_number',
+        'phone',
+        'transaction_date',
+        'status',
+        'result_desc',
+        'order_id',
+        'account_reference',
+        'transaction_type'
+    ];
+    
+    public function order()
+    {
+        return $this->belongsTo(Order::class);
+    }
+}
+
+4. M-Pesa Service Setup
+
+Create the M-Pesa service class:
+bash
+
+php artisan make:service MpesaService
+
+Edit app/Services/MpesaService.php:
+php
+
+<?php
+
+namespace App\Services;
+
+use GuzzleHttp\Client;
+use Illuminate\Support\Facades\Log;
+
+class MpesaService
+{
+    protected $client;
+    protected $baseUrl;
+    protected $consumerKey;
+    protected $consumerSecret;
+    protected $paybill;
+    protected $passkey;
+    
+    public function __construct()
+    {
+        $this->client = new Client();
+        $this->baseUrl = config('mpesa.env') === 'sandbox' 
+            ? 'https://sandbox.safaricom.co.ke/' 
+            : 'https://api.safaricom.co.ke/';
+            
+        $this->consumerKey = config('mpesa.consumer_key');
+        $this->consumerSecret = config('mpesa.consumer_secret');
+        $this->paybill = config('mpesa.paybill');
+        $this->passkey = config('mpesa.passkey');
+    }
+    
+    public function generateAccessToken()
+    {
+        try {
+            $url = $this->baseUrl . 'oauth/v1/generate?grant_type=client_credentials';
+            $response = $this->client->request('GET', $url, [
+                'auth' => [$this->consumerKey, $this->consumerSecret]
+            ]);
+            
+            $result = json_decode($response->getBody());
+            return $result->access_token;
+            
+        } catch (\Exception $e) {
+            Log::error('M-Pesa Token Generation Error: ' . $e->getMessage());
+            return false;
+        }
+    }
+    
+    public function stkPush($phone, $amount, $accountReference, $transactionDesc)
+    {
+        $phone = $this->formatPhoneNumber($phone);
+        $timestamp = date('YmdHis');
+        $password = base64_encode($this->paybill . $this->passkey . $timestamp);
+        
+        $payload = [
+            'BusinessShortCode' => $this->paybill,
+            'Password' => $password,
+            'Timestamp' => $timestamp,
+            'TransactionType' => 'CustomerPayBillOnline',
+            'Amount' => $amount,
+            'PartyA' => $phone,
+            'PartyB' => $this->paybill,
+            'PhoneNumber' => $phone,
+            'CallBackURL' => config('mpesa.callback_url'),
+            'AccountReference' => $accountReference,
+            'TransactionDesc' => $transactionDesc
+        ];
+        
+        try {
+            $url = $this->baseUrl . 'mpesa/stkpush/v1/processrequest';
+            $response = $this->client->request('POST', $url, [
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $this->generateAccessToken(),
+                    'Content-Type' => 'application/json',
+                ],
+                'json' => $payload
+            ]);
+            
+            return json_decode($response->getBody());
+            
+        } catch (\Exception $e) {
+            Log::error('M-Pesa STK Push Error: ' . $e->getMessage());
+            return false;
+        }
+    }
+    
+    public function registerUrls()
+    {
+        $payload = [
+            'ShortCode' => $this->paybill,
+            'ResponseType' => 'Completed',
+            'ConfirmationURL' => config('mpesa.callback_url') . '/confirmation',
+            'ValidationURL' => config('mpesa.callback_url') . '/validation'
+        ];
+        
+        try {
+            $url = $this->baseUrl . 'mpesa/c2b/v1/registerurl';
+            $response = $this->client->request('POST', $url, [
+                'headers' => [
+                    'Authorization' => 'Bearer ' . $this->generateAccessToken(),
+                    'Content-Type' => 'application/json',
+                ],
+                'json' => $payload
+            ]);
+            
+            return json_decode($response->getBody());
+            
+        } catch (\Exception $e) {
+            Log::error('M-Pesa URL Registration Error: ' . $e->getMessage());
+            return false;
+        }
+    }
+    
+    private function formatPhoneNumber($phone)
+    {
+        $phone = preg_replace('/\D/', '', $phone);
+        
+        if (substr($phone, 0, 1) === '0') {
+            $phone = '254' . substr($phone, 1);
+        } elseif (substr($phone, 0, 4) === '+254') {
+            $phone = '254' . substr($phone, 4);
+        }
+        
+        return $phone;
+    }
+}
+
+5. Configuration Setup
+
+Create a config file for M-Pesa:
+bash
+
+php artisan vendor:publish --tag=config
+
+Edit config/mpesa.php:
+php
+
+<?php
+
+return [
+    'env' => env('MPESA_ENV', 'sandbox'),
+    'consumer_key' => env('MPESA_CONSUMER_KEY'),
+    'consumer_secret' => env('MPESA_CONSUMER_SECRET'),
+    'paybill' => env('MPESA_PAYBILL'),
+    'passkey' => env('MPESA_PASSKEY'),
+    'callback_url' => env('MPESA_CALLBACK_URL'),
+];
+
+Update your .env file:
+ini
+
+MPESA_ENV=sandbox
+MPESA_CONSUMER_KEY=your_sandbox_consumer_key
+MPESA_CONSUMER_SECRET=your_sandbox_consumer_secret
+MPESA_PAYBILL=174379
+MPESA_PASSKEY=your_sandbox_passkey
+MPESA_CALLBACK_URL=https://your-ngrok-url.ngrok.io/mpesa/callback
+
+6. Controller Setup
+
+Create the controllers:
+bash
+
+php artisan make:controller OrderController
+php artisan make:controller MpesaController
+php artisan make:controller PaymentController
+
+OrderController.php
+php
+
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Order;
+use Illuminate\Http\Request;
+
+class OrderController extends Controller
+{
+    public function create()
+    {
+        return view('orders.create');
+    }
+    
+    public function store(Request $request)
+    {
+        $request->validate([
+            'customer_name' => 'required',
+            'customer_phone' => 'required',
+            'items' => 'required|array',
+            'items.*.name' => 'required',
+            'items.*.price' => 'required|numeric',
+            'items.*.quantity' => 'required|integer'
+        ]);
+        
+        $total = collect($request->items)->sum(function($item) {
+            return $item['price'] * $item['quantity'];
+        });
+        
+        $order = Order::create([
+            'customer_name' => $request->customer_name,
+            'customer_phone' => $request->customer_phone,
+            'total' => $total,
+            'items' => $request->items
+        ]);
+        
+        return redirect()->route('payment.method', $order->id);
+    }
+    
+    public function show($id)
+    {
+        $order = Order::with('payments')->findOrFail($id);
+        return view('orders.show', compact('order'));
+    }
+}
+
+MpesaController.php
+php
+
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\MpesaTransaction;
+use App\Models\Order;
+use App\Services\MpesaService;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
+
+class MpesaController extends Controller
+{
+    protected $mpesaService;
+    
+    public function __construct(MpesaService $mpesaService)
+    {
+        $this->mpesaService = $mpesaService;
+    }
+    
+    public function registerUrls()
+    {
+        $response = $this->mpesaService->registerUrls();
+        
+        if ($response) {
+            return response()->json([
+                'success' => true,
+                'message' => 'URLs registered successfully',
+                'data' => $response
+            ]);
+        }
+        
+        return response()->json([
+            'success' => false,
+            'message' => 'Failed to register URLs'
+        ], 500);
+    }
+    
+    public function callback(Request $request)
+    {
+        Log::info('M-Pesa Callback: ' . json_encode($request->all()));
+        
+        $callbackData = $request->all();
+        $transactionType = $this->detectCallbackType($callbackData);
+        
+        if ($transactionType === 'stk') {
+            return $this->handleStkCallback($callbackData);
+        } elseif ($transactionType === 'c2b') {
+            return $this->handleC2bCallback($callbackData);
+        }
+        
+        Log::error('Unknown callback type', $callbackData);
+        return response()->json(['status' => 'rejected']);
+    }
+    
+    private function detectCallbackType(array $data)
+    {
+        if (isset($data['Body']['stkCallback'])) {
+            return 'stk';
+        } elseif (isset($data['TransID'])) {
+            return 'c2b';
+        }
+        return 'unknown';
+    }
+    
+    private function handleStkCallback(array $data)
+    {
+        $resultCode = $data['Body']['stkCallback']['ResultCode'] ?? null;
+        
+        if ($resultCode == 0) {
+            $metadata = $data['Body']['stkCallback']['CallbackMetadata']['Item'] ?? [];
+            $details = $this->extractStkMetadata($metadata);
+            
+            $transaction = MpesaTransaction::where('checkout_request_id', $data['Body']['stkCallback']['CheckoutRequestID'])
+                ->first();
+                
+            if ($transaction) {
+                $this->updateTransactionFromCallback($transaction, $details, 'completed');
+                $this->updateOrderPaymentStatus($transaction->order_id);
+            }
+            
+            return response()->json(['status' => 'success']);
+        } else {
+            Log::error('STK Payment failed: ' . ($data['Body']['stkCallback']['ResultDesc'] ?? 'Unknown error'));
+            
+            $transaction = MpesaTransaction::where('checkout_request_id', $data['Body']['stkCallback']['CheckoutRequestID'])
+                ->first();
+                
+            if ($transaction) {
+                $transaction->update([
+                    'status' => 'failed',
+                    'result_desc' => $data['Body']['stkCallback']['ResultDesc'] ?? 'Payment failed'
+                ]);
+            }
+            
+            return response()->json(['status' => 'failed']);
+        }
+    }
+    
+    private function handleC2bCallback(array $data)
+    {
+        $transaction = MpesaTransaction::where('account_reference', $data['BillRefNumber'])
+            ->where('status', 'pending_validation')
+            ->first();
+            
+        if ($transaction) {
+            $details = [
+                'mpesa_receipt_number' => $data['TransID'],
+                'phone' => $data['MSISDN'],
+                'amount' => $data['TransAmount'],
+                'transaction_date' => $data['TransTime']
+            ];
+            
+            $this->updateTransactionFromCallback($transaction, $details, 'completed');
+            $this->updateOrderPaymentStatus($transaction->order_id);
+            
+            return response()->json(['status' => 'success']);
+        }
+        
+        Log::error('C2B transaction not found', $data);
+        return response()->json(['status' => 'rejected']);
+    }
+    
+    private function extractStkMetadata(array $metadata)
+    {
+        $details = [];
+        
+        foreach ($metadata as $item) {
+            switch ($item['Name']) {
+                case 'Amount':
+                    $details['amount'] = $item['Value'];
+                    break;
+                case 'MpesaReceiptNumber':
+                    $details['mpesa_receipt_number'] = $item['Value'];
+                    break;
+                case 'PhoneNumber':
+                    $details['phone'] = $item['Value'];
+                    break;
+                case 'TransactionDate':
+                    $details['transaction_date'] = $item['Value'];
+                    break;
+            }
+        }
+        
+        return $details;
+    }
+    
+    private function updateTransactionFromCallback($transaction, $details, $status)
+    {
+        $transaction->update([
+            'mpesa_receipt_number' => $details['mpesa_receipt_number'] ?? null,
+            'phone' => $details['phone'] ?? $transaction->phone,
+            'amount' => $details['amount'] ?? $transaction->amount,
+            'transaction_date' => $details['transaction_date'] ?? now(),
+            'status' => $status,
+            'result_desc' => 'Payment completed successfully'
+        ]);
+        
+        return $transaction;
+    }
+    
+    private function updateOrderPaymentStatus($orderId)
+    {
+        $order = Order::find($orderId);
+        if ($order) {
+            $order->update(['status' => 'paid']);
+        }
+    }
+}
+
+PaymentController.php
+php
+
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Order;
+use App\Models\MpesaTransaction;
+use App\Services\MpesaService;
+use Illuminate\Http\Request;
+
+class PaymentController extends Controller
+{
+    protected $mpesaService;
+    
+    public function __construct(MpesaService $mpesaService)
+    {
+        $this->mpesaService = $mpesaService;
+    }
+    
+    public function selectMethod($orderId)
+    {
+        $order = Order::findOrFail($orderId);
+        return view('payments.method', compact('order'));
+    }
+    
+    public function processPayment(Request $request, $orderId)
+    {
+        $order = Order::findOrFail($orderId);
+        
+        $request->validate([
+            'phone' => 'required',
+            'payment_method' => 'required|in:express,manual'
+        ]);
+        
+        if ($request->payment_method === 'express') {
+            $response = $this->mpesaService->stkPush(
+                $request->phone,
+                $order->total,
+                'ORDER-' . $order->id,
+                'Payment for order #' . $order->id
+            );
+            
+            if ($response) {
+                MpesaTransaction::create([
+                    'merchant_request_id' => $response->MerchantRequestID,
+                    'checkout_request_id' => $response->CheckoutRequestID,
+                    'order_id' => $order->id,
+                    'phone' => $request->phone,
+                    'amount' => $order->total,
+                    'account_reference' => 'ORDER-' . $order->id,
+                    'transaction_type' => 'stk'
+                ]);
+                
+                return response()->json([
+                    'success' => true,
+                    'method' => 'express',
+                    'checkout_request_id' => $response->CheckoutRequestID,
+                    'message' => 'Payment request sent to your phone'
+                ]);
+            }
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to initiate payment'
+            ], 500);
+            
+        } else {
+            $transaction = MpesaTransaction::create([
+                'order_id' => $order->id,
+                'phone' => $request->phone,
+                'amount' => $order->total,
+                'account_reference' => 'ORDER-' . $order->id,
+                'status' => 'pending_validation',
+                'transaction_type' => 'c2b'
+            ]);
+            
+            return response()->json([
+                'success' => true,
+                'method' => 'manual',
+                'transaction_id' => $transaction->id,
+                'message' => 'Please complete the payment via M-Pesa PayBill'
+            ]);
+        }
+    }
+    
+    public function checkPaymentStatus(Request $request)
+    {
+        $request->validate([
+            'checkout_request_id' => 'required_without:transaction_id',
+            'transaction_id' => 'required_without:checkout_request_id'
+        ]);
+        
+        if ($request->checkout_request_id) {
+            $transaction = MpesaTransaction::where('checkout_request_id', $request->checkout_request_id)
+                ->first();
+                
+            if ($transaction && $transaction->status === 'completed') {
+                return response()->json([
+                    'completed' => true,
+                    'transaction' => $transaction
+                ]);
+            }
+        } elseif ($request->transaction_id) {
+            $transaction = MpesaTransaction::find($request->transaction_id);
+            
+            if ($transaction && $transaction->status === 'completed') {
+                return response()->json([
+                    'completed' => true,
+                    'transaction' => $transaction
+                ]);
+            } elseif ($transaction) {
+                return response()->json([
+                    'completed' => false,
+                    'message' => 'Payment not yet received'
+                ]);
+            }
+        }
+        
+        return response()->json([
+            'completed' => false,
+            'message' => 'Payment not yet completed'
+        ]);
+    }
+    
+    public function paymentSuccess($orderId)
+    {
+        $order = Order::with('payments')->findOrFail($orderId);
+        return view('payments.success', compact('order'));
+    }
+}
+
+7. Route Setup
+
+Update routes/web.php:
+php
+
+<?php
+
+use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\OrderController;
+use App\Http\Controllers\PaymentController;
+use App\Http\Controllers\MpesaController;
+
+Route::get('/', function () {
+    return view('welcome');
+});
+
+Auth::routes();
+
+Route::get('/home', [App\Http\Controllers\HomeController::class, 'index'])->name('home');
+
+// Order Routes
+Route::prefix('orders')->group(function () {
+    Route::get('/create', [OrderController::class, 'create'])->name('orders.create');
+    Route::post('/', [OrderController::class, 'store'])->name('orders.store');
+    Route::get('/{id}', [OrderController::class, 'show'])->name('orders.show');
+});
+
+// Payment Routes
+Route::prefix('payments')->group(function () {
+    Route::get('/method/{orderId}', [PaymentController::class, 'selectMethod'])->name('payment.method');
+    Route::post('/process/{orderId}', [PaymentController::class, 'processPayment'])->name('payment.process');
+    Route::get('/status', [PaymentController::class, 'checkPaymentStatus'])->name('payment.check');
+    Route::get('/success/{orderId}', [PaymentController::class, 'paymentSuccess'])->name('payment.success');
+});
+
+// M-Pesa Routes
+Route::prefix('mpesa')->group(function () {
+    Route::post('/callback', [MpesaController::class, 'callback'])->name('mpesa.callback');
+    Route::post('/register-urls', [MpesaController::class, 'registerUrls'])->name('mpesa.register_urls');
+});
+
+8. View Setup
+
+Create the following views:
+resources/views/orders/create.blade.php
+html
+
+@extends('layouts.app')
+
+@section('content')
+<div class="container">
+    <div class="row justify-content-center">
+        <div class="col-md-8">
+            <div class="card">
+                <div class="card-header">Create New Order</div>
+
+                <div class="card-body">
+                    <form method="POST" action="{{ route('orders.store') }}">
+                        @csrf
+
+                        <div class="form-group row">
+                            <label for="customer_name" class="col-md-4 col-form-label text-md-right">Customer Name</label>
+                            <div class="col-md-6">
+                                <input id="customer_name" type="text" class="form-control" name="customer_name" required autofocus>
+                            </div>
+                        </div>
+
+                        <div class="form-group row">
+                            <label for="customer_phone" class="col-md-4 col-form-label text-md-right">Customer Phone</label>
+                            <div class="col-md-6">
+                                <input id="customer_phone" type="text" class="form-control" name="customer_phone" required>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Order Items</label>
+                            <div id="items-container">
+                                <div class="item-row mb-2">
+                                    <div class="row">
+                                        <div class="col-md-5">
+                                            <input type="text" name="items[0][name]" class="form-control" placeholder="Item name" required>
+                                        </div>
+                                        <div class="col-md-3">
+                                            <input type="number" step="0.01" name="items[0][price]" class="form-control" placeholder="Price" required>
+                                        </div>
+                                        <div class="col-md-3">
+                                            <input type="number" name="items[0][quantity]" class="form-control" placeholder="Qty" required>
+                                        </div>
+                                        <div class="col-md-1">
+                                            <button type="button" class="btn btn-danger remove-item">X</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            <button type="button" id="add-item" class="btn btn-secondary mt-2">Add Item</button>
+                        </div>
+
+                        <div class="form-group row mb-0">
+                            <div class="col-md-6 offset-md-4">
+                                <button type="submit" class="btn btn-primary">
+                                    Create Order
+                                </button>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    let itemCount = 1;
+    
+    // Add item
+    document.getElementById('add-item').addEventListener('click', function() {
+        const container = document.getElementById('items-container');
+        const newItem = document.createElement('div');
+        newItem.className = 'item-row mb-2';
+        newItem.innerHTML = `
+            <div class="row">
+                <div class="col-md-5">
+                    <input type="text" name="items[${itemCount}][name]" class="form-control" placeholder="Item name" required>
+                </div>
+                <div class="col-md-3">
+                    <input type="number" step="0.01" name="items[${itemCount}][price]" class="form-control" placeholder="Price" required>
+                </div>
+                <div class="col-md-3">
+                    <input type="number" name="items[${itemCount}][quantity]" class="form-control" placeholder="Qty" required>
+                </div>
+                <div class="col-md-1">
+                    <button type="button" class="btn btn-danger remove-item">X</button>
+                </div>
+            </div>
+        `;
+        container.appendChild(newItem);
+        itemCount++;
+    });
+    
+    // Remove item
+    document.addEventListener('click', function(e) {
+        if (e.target && e.target.classList.contains('remove-item')) {
+            e.target.closest('.item-row').remove();
+        }
+    });
+});
+</script>
+@endsection
+
+resources/views/payments/method.blade.php
+html
+
+@extends('layouts.app')
+
+@section('content')
+<div class="container">
+    <div class="row justify-content-center">
+        <div class="col-md-8">
+            <div class="card">
+                <div class="card-header">Select Payment Method - Order #{{ $order->id }}</div>
+
+                <div class="card-body">
+                    <h5 class="card-title">Total Amount: Ksh {{ number_format($order->total, 2) }}</h5>
+                    
+                    <div class="payment-options mt-4">
+                        <ul class="nav nav-tabs" id="paymentTabs" role="tablist">
+                            <li class="nav-item">
+                                <a class="nav-link active" id="express-tab" data-toggle="tab" href="#express" role="tab">
+                                    <i class="fas fa-bolt"></i> Express Payment
+                                </a>
+                            </li>
+                            <li class="nav-item">
+                                <a class="nav-link" id="manual-tab" data-toggle="tab" href="#manual" role="tab">
+                                    <i class="fas fa-mobile-alt"></i> Manual Payment
+                                </a>
+                            </li>
+                        </ul>
+                        
+                        <div class="tab-content mt-3">
+                            <!-- Express Payment (STK Push) -->
+                            <div class="tab-pane fade show active" id="express" role="tabpanel">
+                                <form id="expressPaymentForm">
+                                    @csrf
+                                    <div class="form-group">
+                                        <label for="expressPhone">M-Pesa Phone Number</label>
+                                        <input type="text" id="expressPhone" name="phone" class="form-control" 
+                                               value="{{ $order->customer_phone }}" required>
+                                    </div>
+                                    <input type="hidden" name="payment_method" value="express">
+                                    <button type="submit" class="btn btn-primary">
+                                        <i class="fas fa-bolt"></i> Pay Now
+                                    </button>
+                                </form>
+                            </div>
+                            
+                            <!-- Manual Payment (C2B) -->
+                            <div class="tab-pane fade" id="manual" role="tabpanel">
+                                <div class="alert alert-info">
+                                    <p>1. Go to M-Pesa Menu</p>
+                                    <p>2. Select "Pay Bill"</p>
+                                    <p>3. Enter Business Number: <strong id="paybillDisplay">{{ config('mpesa.paybill') }}</strong></p>
+                                    <p>4. Enter Account Number: <strong id="accountNumberDisplay">ORDER-{{ $order->id }}</strong></p>
+                                    <p>5. Enter Amount: <strong>Ksh {{ number_format($order->total, 2) }}</strong></p>
+                                    <p>6. Enter your PIN and confirm</p>
+                                </div>
+                                
+                                <form id="manualPaymentForm">
+                                    @csrf
+                                    <div class="form-group">
+                                        <label for="manualPhone">Confirm Your Phone Number</label>
+                                        <input type="text" id="manualPhone" name="phone" class="form-control" 
+                                               value="{{ $order->customer_phone }}" required>
+                                    </div>
+                                    <input type="hidden" name="payment_method" value="manual">
+                                    <button type="submit" class="btn btn-secondary">
+                                        <i class="fas fa-check-circle"></i> I've Made Payment
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div id="paymentStatus" class="mt-4" style="display: none;">
+                        <!-- Status will appear here -->
+                    </div>
+                    
+                    <div id="paymentDetails" class="mt-4" style="display: none;">
+                        <!-- Payment details will appear here for printing -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    // Handle Express Payment
+    document.getElementById('expressPaymentForm').addEventListener('submit', function(e) {
+        e.preventDefault();
+        const form = this;
+        const statusDiv = document.getElementById('paymentStatus');
+        const detailsDiv = document.getElementById('paymentDetails');
+        
+        statusDiv.innerHTML = `
+            <div class="alert alert-info">
+                <p>Please check your phone and enter your M-Pesa PIN to complete payment.</p>
+                <p>Status: <span id="statusText">Waiting for payment...</span></p>
+            </div>
+        `;
+        statusDiv.style.display = 'block';
+        
+        fetch("{{ route('payment.process', $order->id) }}", {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
+            },
+            body: JSON.stringify({
+                phone: form.phone.value,
+                payment_method: form.payment_method.value
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                document.getElementById('statusText').textContent = 'Payment request sent to your phone';
+                
+                // Start polling for payment status
+                if (data.checkout_request_id) {
+                    pollPaymentStatus(data.checkout_request_id);
+                }
+            } else {
+                document.getElementById('statusText').textContent = 'Error: ' + data.message;
+            }
+        })
+        .catch(error => {
+            document.getElementById('statusText').textContent = 'An error occurred. Please try again.';
+        });
+    });
+    
+    // Handle Manual Payment
+    document.getElementById('manualPaymentForm').addEventListener('submit', function(e) {
+        e.preventDefault();
+        const form = this;
+        const statusDiv = document.getElementById('paymentStatus');
+        
+        statusDiv.innerHTML = `
+            <div class="alert alert-warning">
+                <p>We're verifying your payment. This may take a few moments...</p>
+                <p>Status: <span id="statusText">Validating payment...</span></p>
+            </div>
+        `;
+        statusDiv.style.display = 'block';
+        
+        fetch("{{ route('payment.process', $order->id) }}", {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content
+            },
+            body: JSON.stringify({
+                phone: form.phone.value,
+                payment_method: form.payment_method.value
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                // Start polling for payment validation
+                if (data.transaction_id) {
+                    pollPaymentValidation(data.transaction_id);
+                }
+            } else {
+                document.getElementById('statusText').textContent = 'Error: ' + data.message;
+            }
+        })
+        .catch(error => {
+            document.getElementById('statusText').textContent = 'An error occurred. Please try again.';
+        });
+    });
+    
+    function pollPaymentStatus(checkoutRequestId) {
+        const interval = setInterval(() => {
+            fetch("{{ route('payment.check') }}", {
+                method: 'GET',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    checkout_request_id: checkoutRequestId
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.completed) {
+                    clearInterval(interval);
+                    showPaymentDetails(data.transaction);
+                    document.getElementById('statusText').textContent = 'Payment confirmed!';
+                    
+                    // Redirect to success page after 3 seconds
+                    setTimeout(() => {
+                        window.location.href = "{{ route('payment.success', $order->id) }}";
+                    }, 3000);
+                } else if (data.failed) {
+                    clearInterval(interval);
+                    document.getElementById('statusText').textContent = 'Payment failed: ' + data.message;
+                }
+            });
+        }, 3000); // Check every 3 seconds
+    }
+    
+    function pollPaymentValidation(transactionId) {
+        const interval = setInterval(() => {
+            fetch("{{ route('payment.check') }}", {
+                method: 'GET',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    transaction_id: transactionId
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.completed) {
+                    clearInterval(interval);
+                    showPaymentDetails(data.transaction);
+                    document.getElementById('statusText').textContent = 'Payment confirmed!';
+                    
+                    // Redirect to success page after 3 seconds
+                    setTimeout(() => {
+                        window.location.href = "{{ route('payment.success', $order->id) }}";
+                    }, 3000);
+                } else if (data.failed) {
+                    clearInterval(interval);
+                    document.getElementById('statusText').textContent = 'Payment not yet received. Please try again or contact support.';
+                }
+            });
+        }, 5000); // Check every 5 seconds
+    }
+    
+    function showPaymentDetails(transaction) {
+        const detailsDiv = document.getElementById('paymentDetails');
+        detailsDiv.innerHTML = `
+            <div class="payment-receipt">
+                <h4>Payment Receipt</h4>
+                <div class="receipt-details">
+                    <p><strong>Receipt No:</strong> ${transaction.mpesa_receipt_number}</p>
+                    <p><strong>Date:</strong> ${new Date(transaction.transaction_date).toLocaleString()}</p>
+                    <p><strong>Phone:</strong> ${transaction.phone}</p>
+                    <p><strong>Amount:</strong> Ksh ${parseFloat(transaction.amount).toFixed(2)}</p>
+                    <p><strong>Reference:</strong> ${transaction.account_reference}</p>
+                </div>
+                <button class="btn btn-success print-receipt">
+                    <i class="fas fa-print"></i> Print Receipt
+                </button>
+            </div>
+        `;
+        detailsDiv.style.display = 'block';
+        
+        document.querySelector('.print-receipt')?.addEventListener('click', function() {
+            window.print();
+        });
+    }
+});
+</script>
+
+<style>
+@media print {
+    body * {
+        visibility: hidden;
+    }
+    .payment-receipt, .payment-receipt * {
+        visibility: visible;
+    }
+    .payment-receipt {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+    }
+    .no-print {
+        display: none !important;
+    }
+}
+
+.payment-receipt {
+    background: white;
+    padding: 20px;
+    border: 1px solid #ddd;
+    max-width: 500px;
+    margin: 0 auto;
+}
+
+.receipt-details {
+    margin: 15px 0;
+}

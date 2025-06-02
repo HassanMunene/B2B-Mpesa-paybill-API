@@ -1,0 +1,2 @@
+the following below is a picture of a fee management page I would like us to implement . You can leave the sidebar and the top bar I just need the component for the main page. as usual use shadcn and we can use faker to populate the data for now mate.
+
