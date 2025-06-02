@@ -1,0 +1,518 @@
+Enhanced M-Pesa Integration with ngrok, Dual Payment Options, and Receipt Printing
+
+Let me address all your requirements comprehensively, including local testing with ngrok, dual payment options (STK Push and C2B), receipt printing, and integration with the M-Pesa organization portal.
+1. Local Testing with ngrok
+Setting Up ngrok for Callbacks
+
+    Install ngrok:
+    bash
+
+# On Linux
+sudo snap install ngrok
+
+# Or download from https://ngrok.com/download
+
+Start ngrok:
+bash
+
+ngrok http 8000
+
+(Assuming your Laravel app runs on port 8000)
+
+Update your .env:
+ini
+
+    MPESA_CALLBACK_URL=https://your-ngrok-url.ngrok.io/mpesa/callback
+    APP_URL=https://your-ngrok-url.ngrok.io
+
+    Important: For C2B validation/confirmation URLs to work, you must:
+
+        Register your ngrok URL in the Daraja portal under "My Apps" > "Callback URLs"
+
+        Use the same URL for both Validation and Confirmation during URL registration
+
+2. Dual Payment Options Implementation (STK Push + C2B)
+Updated Payment Form (Blade)
+html
+
+<div class="payment-options">
+    <ul class="nav nav-tabs" id="paymentTabs" role="tablist">
+        <li class="nav-item">
+            <a class="nav-link active" id="express-tab" data-toggle="tab" href="#express" role="tab">
+                <i class="fas fa-bolt"></i> Express Payment
+            </a>
+        </li>
+        <li class="nav-item">
+            <a class="nav-link" id="manual-tab" data-toggle="tab" href="#manual" role="tab">
+                <i class="fas fa-mobile-alt"></i> Manual Payment
+            </a>
+        </li>
+    </ul>
+    
+    <div class="tab-content mt-3">
+        <!-- Express Payment (STK Push) -->
+        <div class="tab-pane fade show active" id="express" role="tabpanel">
+            <form id="expressPaymentForm">
+                @csrf
+                <div class="form-group">
+                    <label for="expressPhone">M-Pesa Phone Number</label>
+                    <input type="text" id="expressPhone" name="phone" class="form-control" 
+                           placeholder="e.g. 07XXXXXXXX" required>
+                </div>
+                <input type="hidden" name="payment_method" value="express">
+                <button type="submit" class="btn btn-primary">
+                    <i class="fas fa-bolt"></i> Pay Now
+                </button>
+            </form>
+        </div>
+        
+        <!-- Manual Payment (C2B) -->
+        <div class="tab-pane fade" id="manual" role="tabpanel">
+            <div class="alert alert-info">
+                <p>1. Go to M-Pesa Menu</p>
+                <p>2. Select "Pay Bill"</p>
+                <p>3. Enter Business Number: <strong id="paybillDisplay">{{ config('mpesa.paybill') }}</strong></p>
+                <p>4. Enter Account Number: <strong id="accountNumberDisplay">ORDER-{{ $order->id }}</strong></p>
+                <p>5. Enter Amount: <strong>Ksh {{ number_format($order->total, 2) }}</strong></p>
+                <p>6. Enter your PIN and confirm</p>
+            </div>
+            
+            <form id="manualPaymentForm">
+                @csrf
+                <div class="form-group">
+                    <label for="manualPhone">Confirm Your Phone Number</label>
+                    <input type="text" id="manualPhone" name="phone" class="form-control" 
+                           placeholder="e.g. 07XXXXXXXX" required>
+                </div>
+                <input type="hidden" name="payment_method" value="manual">
+                <button type="submit" class="btn btn-secondary">
+                    <i class="fas fa-check-circle"></i> I've Made Payment
+                </button>
+            </form>
+        </div>
+    </div>
+</div>
+
+<div id="paymentStatus" class="mt-4" style="display: none;">
+    <!-- Status will appear here -->
+</div>
+
+<div id="paymentDetails" class="mt-4" style="display: none;">
+    <!-- Payment details will appear here for printing -->
+</div>
+
+Updated Controller Methods
+php
+
+// In MpesaController.php
+
+/**
+ * Handle payment submission
+ */
+public function processPayment(Request $request)
+{
+    $request->validate([
+        'phone' => 'required',
+        'payment_method' => 'required|in:express,manual'
+    ]);
+    
+    $order = Order::findOrFail($request->order_id);
+    
+    if ($request->payment_method === 'express') {
+        // STK Push
+        $response = $this->mpesaService->stkPush(
+            $request->phone,
+            $order->total,
+            'ORDER-' . $order->id,
+            'Payment for order #' . $order->id
+        );
+        
+        return response()->json([
+            'success' => true,
+            'method' => 'express',
+            'message' => 'Payment request sent to your phone',
+            'data' => $response
+        ]);
+    } else {
+        // Manual/C2B payment
+        // Store the payment anticipation
+        $transaction = MpesaTransaction::create([
+            'order_id' => $order->id,
+            'phone' => $request->phone,
+            'amount' => $order->total,
+            'account_reference' => 'ORDER-' . $order->id,
+            'status' => 'pending_validation'
+        ]);
+        
+        return response()->json([
+            'success' => true,
+            'method' => 'manual',
+            'message' => 'Please complete the payment via M-Pesa PayBill',
+            'transaction_id' => $transaction->id
+        ]);
+    }
+}
+
+/**
+ * Enhanced Callback Handler
+ */
+public function callback(Request $request)
+{
+    Log::info('M-Pesa Callback: ' . json_encode($request->all()));
+    
+    $callbackData = $request->all();
+    $transactionType = $this->detectCallbackType($callbackData);
+    
+    if ($transactionType === 'stk') {
+        return $this->handleStkCallback($callbackData);
+    } elseif ($transactionType === 'c2b') {
+        return $this->handleC2bCallback($callbackData);
+    }
+    
+    Log::error('Unknown callback type', $callbackData);
+    return response()->json(['status' => 'rejected']);
+}
+
+private function detectCallbackType(array $data)
+{
+    if (isset($data['Body']['stkCallback'])) {
+        return 'stk';
+    } elseif (isset($data['TransID'])) {
+        return 'c2b';
+    }
+    return 'unknown';
+}
+
+private function handleStkCallback(array $data)
+{
+    $resultCode = $data['Body']['stkCallback']['ResultCode'] ?? null;
+    
+    if ($resultCode == 0) {
+        $metadata = $data['Body']['stkCallback']['CallbackMetadata']['Item'] ?? [];
+        $details = $this->extractStkMetadata($metadata);
+        
+        $transaction = MpesaTransaction::where('checkout_request_id', $data['Body']['stkCallback']['CheckoutRequestID'])
+            ->first();
+            
+        if ($transaction) {
+            $this->updateTransactionFromCallback($transaction, $details, 'completed');
+            $this->updateOrderPaymentStatus($transaction->order_id);
+            $this->notifyCustomer($transaction);
+        }
+        
+        return response()->json(['status' => 'success']);
+    } else {
+        Log::error('STK Payment failed: ' . ($data['Body']['stkCallback']['ResultDesc'] ?? 'Unknown error'));
+        return response()->json(['status' => 'failed']);
+    }
+}
+
+private function handleC2bCallback(array $data)
+{
+    $transaction = MpesaTransaction::where('account_reference', $data['BillRefNumber'])
+        ->where('amount', $data['TransAmount'])
+        ->where('status', 'pending_validation')
+        ->first();
+        
+    if ($transaction) {
+        $details = [
+            'mpesa_receipt_number' => $data['TransID'],
+            'phone' => $data['MSISDN'],
+            'amount' => $data['TransAmount'],
+            'transaction_date' => $data['TransTime']
+        ];
+        
+        $this->updateTransactionFromCallback($transaction, $details, 'completed');
+        $this->updateOrderPaymentStatus($transaction->order_id);
+        $this->notifyCustomer($transaction);
+        
+        return response()->json(['status' => 'success']);
+    }
+    
+    Log::error('C2B transaction not found', $data);
+    return response()->json(['status' => 'rejected']);
+}
+
+private function updateTransactionFromCallback($transaction, $details, $status)
+{
+    $transaction->update([
+        'mpesa_receipt_number' => $details['mpesa_receipt_number'] ?? null,
+        'phone' => $details['phone'] ?? $transaction->phone,
+        'amount' => $details['amount'] ?? $transaction->amount,
+        'transaction_date' => $details['transaction_date'] ?? now(),
+        'status' => $status,
+        'result_desc' => 'Payment completed successfully'
+    ]);
+    
+    return $transaction;
+}
+
+3. Real-time Payment Display and Receipt Printing
+JavaScript for Real-time Updates
+javascript
+
+// Handle Express Payment
+$('#expressPaymentForm').submit(function(e) {
+    e.preventDefault();
+    const form = $(this);
+    const statusDiv = $('#paymentStatus');
+    const detailsDiv = $('#paymentDetails');
+    
+    statusDiv.html(`
+        <div class="alert alert-info">
+            <p>Please check your phone and enter your M-Pesa PIN to complete payment.</p>
+            <p>Status: <span id="statusText">Waiting for payment...</span></p>
+        </div>
+    `).show();
+    
+    $.ajax({
+        url: "{{ route('payment.process') }}",
+        method: 'POST',
+        data: form.serialize(),
+        success: function(response) {
+            if (response.success) {
+                // Start polling for payment status
+                pollPaymentStatus(response.data.CheckoutRequestID);
+            }
+        }
+    });
+});
+
+// Handle Manual Payment Confirmation
+$('#manualPaymentForm').submit(function(e) {
+    e.preventDefault();
+    const form = $(this);
+    const statusDiv = $('#paymentStatus');
+    
+    statusDiv.html(`
+        <div class="alert alert-warning">
+            <p>We're verifying your payment. This may take a few moments...</p>
+            <p>Status: <span id="statusText">Validating payment...</span></p>
+        </div>
+    `).show();
+    
+    $.ajax({
+        url: "{{ route('payment.process') }}",
+        method: 'POST',
+        data: form.serialize(),
+        success: function(response) {
+            if (response.success) {
+                // Start polling for payment validation
+                pollPaymentValidation(response.transaction_id);
+            }
+        }
+    });
+});
+
+function pollPaymentStatus(checkoutRequestId) {
+    const interval = setInterval(() => {
+        $.get("{{ route('payment.check') }}", {
+            checkout_request_id: checkoutRequestId
+        }, function(response) {
+            if (response.completed) {
+                clearInterval(interval);
+                showPaymentDetails(response.transaction);
+                $('#statusText').text('Payment confirmed!');
+            } else if (response.failed) {
+                clearInterval(interval);
+                $('#statusText').text('Payment failed: ' + response.message);
+            }
+        });
+    }, 3000); // Check every 3 seconds
+}
+
+function pollPaymentValidation(transactionId) {
+    const interval = setInterval(() => {
+        $.get("{{ route('payment.validate') }}", {
+            transaction_id: transactionId
+        }, function(response) {
+            if (response.completed) {
+                clearInterval(interval);
+                showPaymentDetails(response.transaction);
+                $('#statusText').text('Payment confirmed!');
+            } else if (response.failed) {
+                clearInterval(interval);
+                $('#statusText').text('Payment not yet received. Please try again or contact support.');
+            }
+        });
+    }, 5000); // Check every 5 seconds
+}
+
+function showPaymentDetails(transaction) {
+    const detailsDiv = $('#paymentDetails');
+    detailsDiv.html(`
+        <div class="payment-receipt">
+            <h4>Payment Receipt</h4>
+            <div class="receipt-details">
+                <p><strong>Receipt No:</strong> ${transaction.mpesa_receipt_number}</p>
+                <p><strong>Date:</strong> ${new Date(transaction.transaction_date).toLocaleString()}</p>
+                <p><strong>Phone:</strong> ${transaction.phone}</p>
+                <p><strong>Amount:</strong> Ksh ${parseFloat(transaction.amount).toFixed(2)}</p>
+                <p><strong>Reference:</strong> ${transaction.account_reference}</p>
+            </div>
+            <button class="btn btn-success print-receipt">
+                <i class="fas fa-print"></i> Print Receipt
+            </button>
+        </div>
+    `).show();
+    
+    $('.print-receipt').click(function() {
+        window.print();
+    });
+}
+
+Receipt Printing CSS
+
+Add to your CSS:
+css
+
+@media print {
+    body * {
+        visibility: hidden;
+    }
+    .payment-receipt, .payment-receipt * {
+        visibility: visible;
+    }
+    .payment-receipt {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+    }
+    .no-print {
+        display: none !important;
+    }
+}
+
+.payment-receipt {
+    background: white;
+    padding: 20px;
+    border: 1px solid #ddd;
+    max-width: 500px;
+    margin: 0 auto;
+}
+
+.receipt-details {
+    margin: 15px 0;
+}
+
+.receipt-details p {
+    margin-bottom: 8px;
+    border-bottom: 1px dashed #eee;
+    padding-bottom: 8px;
+}
+
+4. M-Pesa Organization Portal Integration
+
+The M-Pesa Organization Portal (https://org.ke.m-pesa.com/) comes into play for:
+
+    Production Credentials: After testing, you'll need to:
+
+        Apply for a production PayBill number
+
+        Request production API credentials
+
+        Set your production callback URLs
+
+    Transaction Monitoring:
+
+        View all transactions
+
+        Initiate refunds/reversals
+
+        Download transaction reports
+
+    Settlement Reconciliation:
+
+        View daily settlements
+
+        Match transactions with bank deposits
+
+        Resolve discrepancies
+
+Key Integration Points:
+
+    Auto-reconciliation:
+
+        Periodically fetch settlement reports from the portal API
+
+        Match with your database transactions
+
+        Flag any discrepancies
+
+    Dashboard Integration:
+    php
+
+    // Create a service class for Org Portal API
+    class MpesaOrgPortalService {
+        public function getDailySettlements($date) {
+            // Implementation to fetch from org portal
+        }
+        
+        public function initiateRefund($transactionId, $amount) {
+            // Implementation for refunds
+        }
+    }
+
+    Automated Reporting:
+
+        Set up cron jobs to:
+
+            Daily: Fetch and reconcile transactions
+
+            Weekly: Generate sales reports
+
+            Monthly: Prepare VAT reports
+
+5. Complete Workflow Summary
+
+    Customer Chooses Payment Method:
+
+        Express (STK Push): Immediate payment request
+
+        Manual (C2B): Customer pays via PayBill
+
+    Payment Processing:
+
+        For STK: Real-time callback handling
+
+        For C2B: Validation -> Confirmation flow
+
+    Payment Verification:
+
+        Database updates
+
+        Order status changes
+
+        Customer notifications
+
+    Receipt Generation:
+
+        Automatic display after payment
+
+        Printable format
+
+        Optional SMS/email receipt
+
+    Reconciliation:
+
+        Daily sync with M-Pesa Org Portal
+
+        Discrepancy alerts
+
+        Financial reporting
+
+This enhanced implementation gives you a complete solution with:
+
+    Local testing capability via ngrok
+
+    Dual payment options for better UX
+
+    Real-time payment display
+
+    Printable receipts
+
+    Clear integration points with the M-Pesa organization portal
+
+Would you like me to elaborate on any specific part of this implementation?
+New chat
